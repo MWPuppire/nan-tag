@@ -1,0 +1,20 @@
+[package]
+name = "nan-tag"
+# will bump to 1.0.0 if I make a release that documents the API;
+# while undocumented, I'm leaving it zero-ver
+version = "0.1.0"
+edition = "2021"
+description = "NaN-tagged pointers"
+license = "MIT"
+readme = "README.md"
+authors = ["Ben Kelley"]
+repository = "https://github.com/MWPuppire/nan-tag"
+homepage = "https://crates.io/crates/nan-tag"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[features]
+default = ["boxed_ptr"]
+boxed_ptr = []
