@@ -1,20 +1,25 @@
-#![no_std]
-#![feature(strict_provenance)]
+#![allow(unstable_name_collisions)]
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "nightly", feature(strict_provenance))]
 
-#[cfg(all(not(target_pointer_width = "64"), not(target_pointer_with = "128")))]
-compile_error!("Pointer size must be 64 bits");
+#[cfg(any(
+    target_pointer_width = "32",
+    target_pointer_width = "16"
+))]
+compile_error!("Pointer size must be at least 64-bits");
 
-#[cfg(feature = "boxed_ptr")]
-extern crate alloc;
+#[cfg(not(feature = "nightly"))]
+extern crate sptr;
 
 use core::marker::PhantomData;
 use core::ptr;
+#[cfg(not(feature = "nightly"))]
+use sptr::Strict;
 
 const POINTER_MASK: usize = 0x7FF8_0000_0000_0000;
-const ACTUAL_NAN_BITS: usize = 0x7FFC_0000_0000_0000;
-const ACTUAL_NAN: f64 = unsafe {
-    core::mem::transmute::<usize, f64>(ACTUAL_NAN_BITS)
-};
+const ACTUAL_NAN_BITS: u64 = 0x7FFC_0000_0000_0000;
+// `const from_bits` isn't stable yet, so an unsafe transmute is used.
+const ACTUAL_NAN: f64 = unsafe { core::mem::transmute::<u64, f64>(ACTUAL_NAN_BITS) };
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ExtractedNan<'a, T: 'a> {
@@ -22,19 +27,18 @@ pub enum ExtractedNan<'a, T: 'a> {
     Pointer(&'a T),
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, PartialEq)]
 pub enum ExtractedNanMut<'a, T: 'a> {
     Float(f64),
-    Pointer(&'a mut T),
+    PointerMut(&'a mut T),
 }
 
-trait TaggedPtr<'a, T: 'a> {
+pub trait TaggedPtr<'a, T: 'a> {
     fn extract(&self) -> ExtractedNan<'a, T>;
+
     fn is_pointer(&self) -> bool {
-        match self.extract() {
-            ExtractedNan::Pointer(_) => true,
-            _ => false,
-        }
+        matches!(self.extract(), ExtractedNan::Pointer(_))
     }
     fn as_float(&self) -> Option<f64> {
         match self.extract() {
@@ -50,21 +54,32 @@ trait TaggedPtr<'a, T: 'a> {
     }
 }
 
-trait TaggedPtrMut<'a, T: 'a>: TaggedPtr<'a, T> {
+pub trait TaggedPtrMut<'a, T: 'a>: TaggedPtr<'a, T> {
     fn extract_mut(&mut self) -> ExtractedNanMut<'a, T>;
+
     fn as_mut(&mut self) -> Option<&'a mut T> {
         match self.extract_mut() {
-            ExtractedNanMut::Pointer(ptr) => Some(ptr),
+            ExtractedNanMut::PointerMut(ptr) => Some(ptr),
             _ => None,
         }
     }
 }
 
-// stores a pointer instead of an `f64` due to provenance
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// A NaN-tagged pointer to a non-owned value or a 64-bit floating-point,
+/// discriminated by NaN tag.
+#[derive(Copy, Clone, Debug)]
 pub struct TaggedNan<'a, T: 'a> {
     value: *const T,
     phantom: PhantomData<&'a T>,
+}
+
+/// A NaN-tagged pointer to an owned value or a 64-bit floating-point,
+/// discriminated by NaN tag.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct BoxedTaggedNan<T> {
+    value: *mut T,
+    phantom: PhantomData<T>,
 }
 
 impl TaggedNan<'_, ()> {
@@ -72,7 +87,8 @@ impl TaggedNan<'_, ()> {
         Self::new_float_with(value)
     }
 }
-impl<'a, T> TaggedNan<'a, T> {
+
+impl<'a, T: 'a> TaggedNan<'a, T> {
     pub fn new_float_with(value: f64) -> Self {
         let float = if value.is_nan() { ACTUAL_NAN } else { value };
         let bits = float.to_bits() as usize;
@@ -81,18 +97,20 @@ impl<'a, T> TaggedNan<'a, T> {
             phantom: PhantomData,
         }
     }
+
     pub fn new_pointer(ptr: &'a T) -> Self {
-        let ptr: *const T = &*ptr;
+        let ptr: *const T = ptr;
         TaggedNan {
             value: ptr.map_addr(|a| a ^ POINTER_MASK),
             phantom: PhantomData,
         }
     }
 }
-impl<'a, T> TaggedPtr<'a, T> for TaggedNan<'a, T> {
+
+impl<'a, T: 'a> TaggedPtr<'a, T> for TaggedNan<'a, T> {
     fn extract(&self) -> ExtractedNan<'a, T> {
-        let bits = self.value.addr();
-        let float = f64::from_bits(bits as u64);
+        let bits = self.value.addr() as u64;
+        let float = f64::from_bits(bits);
         if !float.is_nan() || bits == ACTUAL_NAN_BITS {
             ExtractedNan::Float(float)
         } else {
@@ -100,52 +118,53 @@ impl<'a, T> TaggedPtr<'a, T> for TaggedNan<'a, T> {
             ExtractedNan::Pointer(unsafe { ptr.as_ref::<'a>().unwrap() })
         }
     }
-    fn is_pointer(&self) -> bool {
-        self.value.addr() & POINTER_MASK == POINTER_MASK
-    /*
-        let bits = self.value.addr();
-        let float = f64::from_bits(bits as u64);
-        float.is_nan() && bits != ACTUAL_NAN_BITS
-    */
+}
+
+impl<'a, T: PartialEq + 'a> PartialEq for TaggedNan<'a, T> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.is_pointer() {
+            unsafe { *self.value == *other.value }
+        } else {
+            let self_bits = self.value.addr() as u64;
+            let other_bits = other.value.addr() as u64;
+            f64::from_bits(self_bits) == f64::from_bits(other_bits)
+        }
     }
 }
 
-#[cfg(feature = "boxed_ptr")]
-use alloc::boxed::Box;
-#[cfg(feature = "boxed_ptr")]
-#[derive(Debug, PartialEq)]
-pub struct BoxedTaggedNan<T> {
-    value: *mut T,
-}
-
-#[cfg(feature = "boxed_ptr")]
+#[cfg(feature = "std")]
 impl BoxedTaggedNan<()> {
     pub fn new_float(value: f64) -> Self {
         Self::new_float_with(value)
     }
 }
-#[cfg(feature = "boxed_ptr")]
+
+#[cfg(feature = "std")]
 impl<T> BoxedTaggedNan<T> {
     pub fn new_float_with(value: f64) -> Self {
         let float = if value.is_nan() { ACTUAL_NAN } else { value };
         let bits = float.to_bits() as usize;
         BoxedTaggedNan {
             value: ptr::null_mut::<T>().with_addr(bits),
+            phantom: PhantomData,
         }
     }
+
     pub fn new_pointer(val: T) -> Self {
         let boxed = Box::new(val);
         let ptr = Box::into_raw(boxed);
         BoxedTaggedNan {
-            value: ptr.map_addr(|a| a ^ POINTER_MASK),
+            value: ptr,
+            phantom: PhantomData,
         }
     }
 }
-#[cfg(feature = "boxed_ptr")]
+
+#[cfg(feature = "std")]
 impl<'a, T: 'a> TaggedPtr<'a, T> for BoxedTaggedNan<T> {
     fn extract(&self) -> ExtractedNan<'a, T> {
-        let bits = self.value.addr();
-        let float = f64::from_bits(bits as u64);
+        let bits = self.value.addr() as u64;
+        let float = f64::from_bits(bits);
         if !float.is_nan() || bits == ACTUAL_NAN_BITS {
             ExtractedNan::Float(float)
         } else {
@@ -153,128 +172,60 @@ impl<'a, T: 'a> TaggedPtr<'a, T> for BoxedTaggedNan<T> {
             ExtractedNan::Pointer(unsafe { ptr.as_ref::<'a>().unwrap() })
         }
     }
-    fn is_pointer(&self) -> bool {
-        let bits = self.value.addr();
-        let float = f64::from_bits(bits as u64);
-        float.is_nan() && bits != ACTUAL_NAN_BITS
-    }
 }
-#[cfg(feature = "boxed_ptr")]
+
+#[cfg(feature = "std")]
 impl<'a, T: 'a> TaggedPtrMut<'a, T> for BoxedTaggedNan<T> {
     fn extract_mut(&mut self) -> ExtractedNanMut<'a, T> {
-        let bits = self.value.addr();
-        let float = f64::from_bits(bits as u64);
+        let bits = self.value.addr() as u64;
+        let float = f64::from_bits(bits);
         if !float.is_nan() || bits == ACTUAL_NAN_BITS {
             ExtractedNanMut::Float(float)
         } else {
             let ptr = self.value.map_addr(|a| a ^ POINTER_MASK);
-            ExtractedNanMut::Pointer(unsafe { ptr.as_mut::<'a>().unwrap() })
+            ExtractedNanMut::PointerMut(unsafe { ptr.as_mut::<'a>().unwrap() })
         }
     }
 }
-#[cfg(feature = "boxed_ptr")]
+
+#[cfg(feature = "std")]
 impl<T> Drop for BoxedTaggedNan<T> {
     fn drop(&mut self) {
         if self.is_pointer() {
-            unsafe { Box::from_raw(self.value.map_addr(|a| a ^ POINTER_MASK)) };
+            drop(unsafe { Box::from_raw(self.value) });
         }
     }
 }
-#[cfg(feature = "boxed_ptr")]
+
+#[cfg(feature = "std")]
 impl<T: Clone> Clone for BoxedTaggedNan<T> {
     fn clone(&self) -> Self {
         if self.is_pointer() {
-            let this_box = unsafe { Box::from_raw(self.value.map_addr(|a| a ^ POINTER_MASK ))};
+            let this_box = unsafe { Box::from_raw(self.value) };
             let new_ptr = Box::into_raw(this_box.clone());
             Box::leak(this_box);
             BoxedTaggedNan {
                 value: new_ptr,
+                phantom: PhantomData,
             }
         } else {
             BoxedTaggedNan {
                 value: self.value,
+                phantom: PhantomData,
             }
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_pointer() {
-        let x = 9;
-        let y = &x;
-        let tagged = TaggedNan::new_pointer(y);
-        assert_eq!(Some(y), tagged.as_ref());
-    }
-
-    #[test]
-    fn extract_nan() {
-        let tagged = TaggedNan::new_float(f64::NAN);
-        if let Some(float) = tagged.as_float() {
-            assert!(float.is_nan());
+#[cfg(feature = "std")]
+impl<T: PartialEq> PartialEq for BoxedTaggedNan<T> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.is_pointer() {
+            unsafe { *self.value == *other.value }
         } else {
-            panic!("Failed to extract NaN");
+            let self_bits = self.value.addr() as u64;
+            let other_bits = other.value.addr() as u64;
+            f64::from_bits(self_bits) == f64::from_bits(other_bits)
         }
-    }
-
-    #[test]
-    fn extract_float() {
-        let tagged = TaggedNan::new_float(24.5);
-        assert_eq!(Some(24.5), tagged.as_float());
-    }
-
-    #[test]
-    fn reassigning() {
-        let mut tagged = TaggedNan::<i32>::new_float_with(17.5);
-        assert_eq!(Some(17.5), tagged.as_float());
-        let data = 12;
-        let ptr = &data;
-        tagged = TaggedNan::new_pointer(&ptr);
-        assert_eq!(Some(ptr), tagged.as_ref());
-    }
-
-    #[test]
-    fn lifetime_float() {
-        let tagged;
-        {
-            tagged = TaggedNan::new_float(20.5);
-        }
-        assert_eq!(Some(20.5), tagged.as_float());
-    }
-
-    // This test should fail to compile due to lifetimes
-    #[test]
-    #[cfg(cfail)]
-    fn lifetime_miscompile() {
-        let tagged;
-        {
-            let x = 17;
-            let y = &x;
-            tagged = TaggedNan::new_pointer(y);
-        }
-        tagged.extract();
-    }
-
-    #[cfg(feature = "boxed_ptr")]
-    #[test]
-    fn mutable_extract() {
-        let x = alloc::string::String::from("hello");
-        let mut boxed = BoxedTaggedNan::new_pointer(x);
-        boxed.as_mut().unwrap().push_str(" world");
-        assert_eq!("hello world", boxed.as_ref().unwrap().as_str());
-    }
-
-    #[cfg(feature = "boxed_ptr")]
-    #[test]
-    fn does_drop() {
-        let x = alloc::rc::Rc::new(12);
-        let copy = x.clone();
-        let boxed = BoxedTaggedNan::new_pointer(copy);
-        assert_eq!(2, alloc::rc::Rc::strong_count(&x));
-        core::mem::drop(boxed);
-        assert_eq!(1, alloc::rc::Rc::strong_count(&x));
     }
 }

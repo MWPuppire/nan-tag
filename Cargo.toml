@@ -2,19 +2,25 @@
 name = "nan-tag"
 # will bump to 1.0.0 if I make a release that documents the API;
 # while undocumented, I'm leaving it zero-ver
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "NaN-tagged pointers"
+description = "NaN-tagged pointers in Rust, storing an f64 in the same space as a pointer"
 license = "MIT"
 readme = "README.md"
 authors = ["Ben Kelley"]
 repository = "https://github.com/MWPuppire/nan-tag"
 homepage = "https://crates.io/crates/nan-tag"
+rust-version = "1.60"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+sptr = "0.3"
+
+[dev-dependencies]
+trybuild = "1.0"
 
 [features]
-default = ["boxed_ptr"]
-boxed_ptr = []
+default = ["std"]
+std = []
+nightly = []

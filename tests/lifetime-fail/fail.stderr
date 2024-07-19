@@ -1,0 +1,12 @@
+error[E0597]: `x` does not live long enough
+  --> tests/lifetime-fail/fail.rs:7:17
+   |
+6  |         let x = 17;
+   |             - binding `x` declared here
+7  |         let y = &x;
+   |                 ^^ borrowed value does not live long enough
+8  |         tagged = TaggedNan::new_pointer(y);
+9  |     }
+   |     - `x` dropped here while still borrowed
+10 |     tagged.extract();
+   |     ------ borrow later used here
